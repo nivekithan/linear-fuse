@@ -1,0 +1,4 @@
+CompileFlags:
+  Add:
+    - -I/home/nivekithan/code/learn-c/vendor/libfuse/include
+    - -I/home/nivekithan/code/learn-c/vendor/libfuse/builddir

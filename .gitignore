@@ -1,0 +1,5 @@
+other-repo
+output
+builddir
+*.out
+mnt/
