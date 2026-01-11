@@ -7,15 +7,42 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #define LINEAR_GRAPHQL_URL "https://api.linear.app/graphql"
+
+#define LINEAR_CURL_CONNECT_TIMEOUT_MS 5000L
+#define LINEAR_CURL_TIMEOUT_MS 20000L
+#define LINEAR_CURL_LOW_SPEED_LIMIT 100L
+#define LINEAR_CURL_LOW_SPEED_TIME 10L
 
 struct linear_memory_buffer {
     char *data;
     size_t size;
 };
+
+static bool linear_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    const char *env = getenv("LINEARFS_DEBUG");
+    enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return enabled == 1;
+}
+
+static void linear_debug(const char *fmt, ...) {
+    if (!linear_debug_enabled()) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
 
 static size_t linear_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total_size = size * nmemb;
@@ -61,14 +88,6 @@ static const char *linear_skip_spaces(const char *s) {
     return s;
 }
 
-static bool linear_has_bearer_prefix(const char *token) {
-    token = linear_skip_spaces(token);
-    if (token == NULL) {
-        return false;
-    }
-
-    return strncasecmp(token, "Bearer ", 7) == 0;
-}
 
 static CURLcode linear_perform_request(
     CURL *curl,
@@ -93,10 +112,33 @@ static CURLcode linear_perform_request(
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, linear_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)response);
 
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, LINEAR_CURL_CONNECT_TIMEOUT_MS);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, LINEAR_CURL_TIMEOUT_MS);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, LINEAR_CURL_LOW_SPEED_LIMIT);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, LINEAR_CURL_LOW_SPEED_TIME);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "learn-c-linearfs/1");
+
+    linear_debug("linear: POST /graphql (%zu bytes)\n", (payload != NULL) ? strlen(payload) : 0UL);
     CURLcode result = curl_easy_perform(curl);
+
+    long local_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &local_code);
+
+    double total_time = 0.0;
+    curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_time);
+
+    linear_debug(
+        "linear: result=%d http=%ld time=%.3fs bytes=%zu\n",
+        (int)result,
+        local_code,
+        total_time,
+        (response != NULL) ? response->size : 0
+    );
+
     if (result == CURLE_OK && http_code != NULL) {
-        *http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
+        *http_code = local_code;
     }
 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
@@ -127,33 +169,20 @@ static void linear_report_graphql_errors(cJSON *root) {
 }
 
 static const char *linear_get_env_token(void) {
-    const char *token = getenv("LINEAR_API_KEY");
-    if (token == NULL || token[0] == '\0') {
-        token = getenv("LINEAR_ACCESS_TOKEN");
-    }
+    const char *token = getenv("LINEAR_ACCESS_TOKEN");
 
     if (token == NULL || token[0] == '\0') {
-        fprintf(stderr, "LINEAR_API_KEY (personal API key) is not set\n");
+        fprintf(stderr, "LINEAR_ACCESS_TOKEN (personal access token) is not set\n");
         return NULL;
     }
 
     const char *token_trimmed = linear_skip_spaces(token);
     if (token_trimmed == NULL || token_trimmed[0] == '\0') {
-        fprintf(stderr, "Linear API key is empty\n");
+        fprintf(stderr, "Linear access token is empty\n");
         return NULL;
     }
 
-    const char *token_value = token_trimmed;
-    if (linear_has_bearer_prefix(token_trimmed)) {
-        token_value = linear_skip_spaces(token_trimmed + 7);
-    }
-
-    if (token_value == NULL || token_value[0] == '\0') {
-        fprintf(stderr, "Linear API key is empty\n");
-        return NULL;
-    }
-
-    return token_value;
+    return token_trimmed;
 }
 
 static char *linear_build_auth_header(void) {
@@ -275,8 +304,13 @@ static struct linear_issue_list linear_issues_from_response(const char *json, si
     linear_report_graphql_errors(root);
 
     cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "data");
-    cJSON *project = (data != NULL) ? cJSON_GetObjectItemCaseSensitive(data, "project") : NULL;
-    cJSON *issues = (project != NULL) ? cJSON_GetObjectItemCaseSensitive(project, "issues") : NULL;
+
+    cJSON *issues = (data != NULL) ? cJSON_GetObjectItemCaseSensitive(data, "issues") : NULL;
+    if (issues == NULL && data != NULL) {
+        cJSON *project = cJSON_GetObjectItemCaseSensitive(data, "project");
+        issues = (project != NULL) ? cJSON_GetObjectItemCaseSensitive(project, "issues") : NULL;
+    }
+
     cJSON *nodes = (issues != NULL) ? cJSON_GetObjectItemCaseSensitive(issues, "nodes") : NULL;
 
     if (nodes == NULL || !cJSON_IsArray(nodes)) {
@@ -439,9 +473,9 @@ struct linear_issue_list linear_list_project_issues(const char *project_id, size
     int payload_size = snprintf(
         NULL,
         0,
-        "{\"query\":\"query { project(id: \\\"%s\\\") { issues(first: %zu) { nodes { id identifier title description state { name } assignee { name } } } } }\"}",
-        project_id,
-        max_issues
+        "{\"query\":\"query { issues(first: %zu, filter: { project: { id: { eq: \\\"%s\\\" } } }) { nodes { id identifier title description state { name } assignee { name } } } }\"}",
+        max_issues,
+        project_id
     );
 
     if (payload_size < 0) {
@@ -459,9 +493,9 @@ struct linear_issue_list linear_list_project_issues(const char *project_id, size
     snprintf(
         payload,
         payload_len,
-        "{\"query\":\"query { project(id: \\\"%s\\\") { issues(first: %zu) { nodes { id identifier title description state { name } assignee { name } } } } }\"}",
-        project_id,
-        max_issues
+        "{\"query\":\"query { issues(first: %zu, filter: { project: { id: { eq: \\\"%s\\\" } } }) { nodes { id identifier title description state { name } assignee { name } } } }\"}",
+        max_issues,
+        project_id
     );
 
     CURL *curl = curl_easy_init();

@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <stdarg.h>
 
 #include "curl/curl.h"
 #include "helper.c"
@@ -22,6 +24,173 @@
 static struct timespec mount_time;
 
 static struct linear_project_list linear_projects = {0};
+
+#define LINEARFS_MAX_ISSUES 50
+#define LINEARFS_ISSUES_CACHE_TTL_SEC 30
+
+struct linear_issue_cache_entry {
+    char *project_id;
+    struct linear_issue_list issues;
+    time_t fetched_at;
+};
+
+static pthread_mutex_t issues_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct linear_issue_cache_entry *issues_cache = NULL;
+static size_t issues_cache_count = 0;
+
+static char *linearfs_strdup(const char *src) {
+    if (src == NULL) {
+        return NULL;
+    }
+
+    size_t len = strlen(src);
+    char *out = malloc(len + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+
+    memcpy(out, src, len + 1);
+    return out;
+}
+
+static bool linearfs_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled != -1) {
+        return enabled == 1;
+    }
+
+    const char *env = getenv("LINEARFS_DEBUG");
+    enabled = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return enabled == 1;
+}
+
+static void linearfs_log(const char *fmt, ...) {
+    if (!linearfs_debug_enabled()) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+}
+
+static struct linear_issue_cache_entry *linearfs_find_cache_entry(const char *project_id) {
+    if (project_id == NULL) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < issues_cache_count; i++) {
+        if (issues_cache[i].project_id != NULL && strcmp(issues_cache[i].project_id, project_id) == 0) {
+            return &issues_cache[i];
+        }
+    }
+
+    return NULL;
+}
+
+static struct linear_issue_cache_entry *linearfs_get_or_create_cache_entry_locked(const char *project_id) {
+    struct linear_issue_cache_entry *entry = linearfs_find_cache_entry(project_id);
+    if (entry != NULL) {
+        return entry;
+    }
+
+    struct linear_issue_cache_entry *new_cache =
+        realloc(issues_cache, (issues_cache_count + 1) * sizeof(*issues_cache));
+    if (new_cache == NULL) {
+        return NULL;
+    }
+    issues_cache = new_cache;
+
+    entry = &issues_cache[issues_cache_count];
+    memset(entry, 0, sizeof(*entry));
+    entry->project_id = linearfs_strdup(project_id);
+    if (entry->project_id == NULL) {
+        return NULL;
+    }
+
+    issues_cache_count++;
+    return entry;
+}
+
+static const struct linear_issue_list *linearfs_project_issues_locked(const char *project_id) {
+    if (project_id == NULL || project_id[0] == '\0') {
+        return NULL;
+    }
+
+    struct linear_issue_cache_entry *entry = linearfs_get_or_create_cache_entry_locked(project_id);
+    if (entry == NULL) {
+        return NULL;
+    }
+
+    time_t now = time(NULL);
+    bool refresh = entry->fetched_at == 0 || (now - entry->fetched_at) >= LINEARFS_ISSUES_CACHE_TTL_SEC;
+    if (refresh) {
+        linearfs_log("linearfs: refreshing issues for project %s\n", project_id);
+        linear_free_issue_list(&entry->issues);
+        entry->issues = linear_list_project_issues(project_id, LINEARFS_MAX_ISSUES);
+        entry->fetched_at = now;
+    }
+
+    return &entry->issues;
+}
+
+static void linearfs_free_issue_fields(struct linear_issue *issue) {
+    if (issue == NULL) {
+        return;
+    }
+
+    free(issue->id);
+    free(issue->identifier);
+    free(issue->title);
+    free(issue->description);
+    free(issue->state);
+    free(issue->assignee);
+    memset(issue, 0, sizeof(*issue));
+}
+
+static bool linearfs_copy_issue_fields(const struct linear_issue *src, struct linear_issue *dst) {
+    if (src == NULL || dst == NULL) {
+        return false;
+    }
+
+    memset(dst, 0, sizeof(*dst));
+    dst->id = linearfs_strdup((src->id != NULL) ? src->id : "");
+    dst->identifier = linearfs_strdup((src->identifier != NULL) ? src->identifier : "");
+    dst->title = linearfs_strdup((src->title != NULL) ? src->title : "");
+    dst->description = linearfs_strdup((src->description != NULL) ? src->description : "");
+    dst->state = linearfs_strdup((src->state != NULL) ? src->state : "");
+    dst->assignee = linearfs_strdup((src->assignee != NULL) ? src->assignee : "");
+
+    if (
+        dst->id == NULL ||
+        dst->identifier == NULL ||
+        dst->title == NULL ||
+        dst->description == NULL ||
+        dst->state == NULL ||
+        dst->assignee == NULL
+    ) {
+        linearfs_free_issue_fields(dst);
+        return false;
+    }
+
+    return true;
+}
+
+static void linearfs_free_issues_cache(void) {
+    pthread_mutex_lock(&issues_cache_mutex);
+
+    for (size_t i = 0; i < issues_cache_count; i++) {
+        free(issues_cache[i].project_id);
+        linear_free_issue_list(&issues_cache[i].issues);
+    }
+    free(issues_cache);
+
+    issues_cache = NULL;
+    issues_cache_count = 0;
+
+    pthread_mutex_unlock(&issues_cache_mutex);
+}
 
 static void linear_project_fs_name(const char *project_name, char *out, size_t out_size) {
     if (out_size == 0) {
@@ -150,9 +319,9 @@ static const struct linear_issue *find_issue_by_filename_in_list(const struct li
     return NULL;
 }
 
-static char *render_issue_markdown(const struct linear_issue *issue, size_t *out_len) {
-    if (issue == NULL) {
-        return NULL;
+static bool issue_markdown_len(const struct linear_issue *issue, size_t *out_len) {
+    if (issue == NULL || out_len == NULL) {
+        return false;
     }
 
     const char *status = (issue->state != NULL && issue->state[0] != '\0') ? issue->state : "Unknown";
@@ -171,10 +340,28 @@ static char *render_issue_markdown(const struct linear_issue *issue, size_t *out
     );
 
     if (needed < 0) {
+        return false;
+    }
+
+    *out_len = (size_t)needed;
+    return true;
+}
+
+static char *render_issue_markdown(const struct linear_issue *issue, size_t *out_len) {
+    if (issue == NULL) {
         return NULL;
     }
 
-    size_t len = (size_t)needed;
+    size_t len = 0;
+    if (!issue_markdown_len(issue, &len)) {
+        return NULL;
+    }
+
+    const char *status = (issue->state != NULL && issue->state[0] != '\0') ? issue->state : "Unknown";
+    const char *assigned_to = (issue->assignee != NULL && issue->assignee[0] != '\0') ? issue->assignee : "Unassigned";
+    const char *title = (issue->title != NULL) ? issue->title : "";
+    const char *description = (issue->description != NULL) ? issue->description : "";
+
     char *content = malloc(len + 1);
     if (content == NULL) {
         return NULL;
@@ -203,6 +390,10 @@ static size_t min_size(size_t a, size_t b) {
 
 int my_getattr(const char *path, struct stat *stat, struct fuse_file_info *file_info) {
     (void)file_info;
+
+    if (stat != NULL) {
+        memset(stat, 0, sizeof(*stat));
+    }
 
     uint user_id = geteuid();
     uint group_id = getegid();
@@ -238,21 +429,17 @@ int my_getattr(const char *path, struct stat *stat, struct fuse_file_info *file_
         return 0;
     }
 
-    struct linear_issue_list issues = linear_list_project_issues(project->id, 50);
-    const struct linear_issue *issue = find_issue_by_filename_in_list(&issues, file_leaf);
-    if (issue == NULL) {
-        linear_free_issue_list(&issues);
-        return -ENOENT;
-    }
+    pthread_mutex_lock(&issues_cache_mutex);
+    const struct linear_issue_list *issues = linearfs_project_issues_locked(project->id);
+    const struct linear_issue *issue = find_issue_by_filename_in_list(issues, file_leaf);
 
     size_t content_len = 0;
-    char *content = render_issue_markdown(issue, &content_len);
-    linear_free_issue_list(&issues);
+    bool ok = (issue != NULL) && issue_markdown_len(issue, &content_len);
+    pthread_mutex_unlock(&issues_cache_mutex);
 
-    if (content == NULL) {
+    if (!ok) {
         return -ENOENT;
     }
-    free(content);
 
     stat->st_mode = S_IFREG | 0644;
     stat->st_nlink = 1;
@@ -279,16 +466,24 @@ int my_read(const char *path, char *output, size_t read_size, off_t offset, stru
         return -ENOENT;
     }
 
-    struct linear_issue_list issues = linear_list_project_issues(project->id, 50);
-    const struct linear_issue *issue = find_issue_by_filename_in_list(&issues, file_leaf);
-    if (issue == NULL) {
-        linear_free_issue_list(&issues);
+    struct linear_issue issue_copy;
+    bool ok = false;
+
+    pthread_mutex_lock(&issues_cache_mutex);
+    const struct linear_issue_list *issues = linearfs_project_issues_locked(project->id);
+    const struct linear_issue *issue = find_issue_by_filename_in_list(issues, file_leaf);
+    if (issue != NULL) {
+        ok = linearfs_copy_issue_fields(issue, &issue_copy);
+    }
+    pthread_mutex_unlock(&issues_cache_mutex);
+
+    if (!ok) {
         return -ENOENT;
     }
 
     size_t content_len = 0;
-    char *content = render_issue_markdown(issue, &content_len);
-    linear_free_issue_list(&issues);
+    char *content = render_issue_markdown(&issue_copy, &content_len);
+    linearfs_free_issue_fields(&issue_copy);
 
     if (content == NULL) {
         return -ENOENT;
@@ -319,9 +514,10 @@ int my_open(const char *path, struct fuse_file_info *file_info) {
         return -ENOENT;
     }
 
-    struct linear_issue_list issues = linear_list_project_issues(project->id, 50);
-    const struct linear_issue *issue = find_issue_by_filename_in_list(&issues, file_leaf);
-    linear_free_issue_list(&issues);
+    pthread_mutex_lock(&issues_cache_mutex);
+    const struct linear_issue_list *issues = linearfs_project_issues_locked(project->id);
+    const struct linear_issue *issue = find_issue_by_filename_in_list(issues, file_leaf);
+    pthread_mutex_unlock(&issues_cache_mutex);
 
     if (issue == NULL) {
         return -ENOENT;
@@ -342,21 +538,51 @@ int my_readir(
     struct fuse_file_info *file_info,
     enum fuse_readdir_flags readdir_flags
 ) {
-    (void)offset;
     (void)file_info;
     (void)readdir_flags;
 
+    size_t dir_offset = (offset < 0) ? 0 : (size_t)offset;
+
+    uint user_id = geteuid();
+    uint group_id = getegid();
+
     if (are_string_equal(path, "/")) {
-        filler(buf, ".", NULL, 0, 0);
-        filler(buf, "..", NULL, 0, 0);
+        struct stat dir_stat = {0};
+        dir_stat.st_mode = S_IFDIR | 0755;
+        dir_stat.st_nlink = 2;
+        dir_stat.st_uid = user_id;
+        dir_stat.st_gid = group_id;
+        dir_stat.st_atim = mount_time;
+        dir_stat.st_mtim = mount_time;
+
+        if (dir_offset == 0) {
+            if (filler(buf, ".", &dir_stat, 1, FUSE_FILL_DIR_PLUS) != 0) {
+                return 0;
+            }
+        }
+
+        if (dir_offset <= 1) {
+            if (filler(buf, "..", &dir_stat, 2, FUSE_FILL_DIR_PLUS) != 0) {
+                return 0;
+            }
+        }
+
+        size_t project_start = 0;
+        if (dir_offset > 2) {
+            project_start = dir_offset - 2;
+        }
 
         char safe_name[256];
-        for (size_t i = 0; i < linear_projects.count; i++) {
+        for (size_t i = project_start; i < linear_projects.count; i++) {
             linear_project_fs_name(linear_projects.projects[i].name, safe_name, sizeof(safe_name));
             if (safe_name[0] == '\0') {
                 continue;
             }
-            filler(buf, safe_name, NULL, 0, 0);
+
+            off_t next_offset = (off_t)(i + 3);
+            if (filler(buf, safe_name, &dir_stat, next_offset, FUSE_FILL_DIR_PLUS) != 0) {
+                break;
+            }
         }
 
         return 0;
@@ -377,22 +603,85 @@ int my_readir(
         return -ENOENT;
     }
 
-    struct linear_issue_list issues = linear_list_project_issues(project->id, 50);
+    struct stat dir_stat = {0};
+    dir_stat.st_mode = S_IFDIR | 0755;
+    dir_stat.st_nlink = 2;
+    dir_stat.st_uid = user_id;
+    dir_stat.st_gid = group_id;
+    dir_stat.st_atim = mount_time;
+    dir_stat.st_mtim = mount_time;
 
-    filler(buf, ".", NULL, 0, 0);
-    filler(buf, "..", NULL, 0, 0);
+    struct stat file_stat = {0};
+    file_stat.st_mode = S_IFREG | 0644;
+    file_stat.st_nlink = 1;
+    file_stat.st_uid = user_id;
+    file_stat.st_gid = group_id;
+    file_stat.st_atim = mount_time;
+    file_stat.st_mtim = mount_time;
+
+    if (dir_offset == 0) {
+        if (filler(buf, ".", &dir_stat, 1, FUSE_FILL_DIR_PLUS) != 0) {
+            return 0;
+        }
+    }
+
+    if (dir_offset <= 1) {
+        if (filler(buf, "..", &dir_stat, 2, FUSE_FILL_DIR_PLUS) != 0) {
+            return 0;
+        }
+    }
+
+    size_t issue_start = 0;
+    if (dir_offset > 2) {
+        issue_start = dir_offset - 2;
+    }
+
+    pthread_mutex_lock(&issues_cache_mutex);
+    const struct linear_issue_list *issues = linearfs_project_issues_locked(project->id);
+    if (issues == NULL) {
+        pthread_mutex_unlock(&issues_cache_mutex);
+        return 0;
+    }
 
     char issue_name[256];
-    for (size_t i = 0; i < issues.count; i++) {
-        linear_issue_fs_name(issues.issues[i].identifier, issue_name, sizeof(issue_name));
+    for (size_t i = issue_start; i < issues->count; i++) {
+        linear_issue_fs_name(issues->issues[i].identifier, issue_name, sizeof(issue_name));
         if (issue_name[0] == '\0') {
             continue;
         }
-        filler(buf, issue_name, NULL, 0, 0);
+
+        size_t content_len = 0;
+        if (issue_markdown_len(&issues->issues[i], &content_len)) {
+            file_stat.st_size = (off_t)content_len;
+        } else {
+            file_stat.st_size = 0;
+        }
+
+        off_t next_offset = (off_t)(i + 3);
+        if (filler(buf, issue_name, &file_stat, next_offset, FUSE_FILL_DIR_PLUS) != 0) {
+            break;
+        }
     }
 
-    linear_free_issue_list(&issues);
+    pthread_mutex_unlock(&issues_cache_mutex);
     return 0;
+}
+
+static void *my_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+    (void)conn;
+
+    if (cfg != NULL) {
+        cfg->entry_timeout = 5.0;
+        cfg->attr_timeout = 5.0;
+        cfg->negative_timeout = 1.0;
+    }
+
+    return NULL;
+}
+
+static void my_destroy(void *private_data) {
+    (void)private_data;
+    linearfs_free_issues_cache();
 }
 
 static struct fuse_operations my_fuse_op = {
@@ -400,6 +689,8 @@ static struct fuse_operations my_fuse_op = {
     .read = my_read,
     .readdir = my_readir,
     .open = my_open,
+    .init = my_init,
+    .destroy = my_destroy,
 };
 
 int main(int argc, char *argv[]) {

@@ -4,7 +4,7 @@ set dotenv-load
 build:
     clang -I ./vendor/libfuse/include -I ./vendor/libfuse/builddir -I ./vendor/cjson \
         -L ./vendor/libfuse/builddir/lib \
-        ./src/hello.c ./vendor/cjson/cJSON.c -l fuse3 -l curl -lm
+        ./src/hello.c ./vendor/cjson/cJSON.c -l fuse3 -l curl -lm -pthread
 
 run: build
     mkdir -p ./mnt
