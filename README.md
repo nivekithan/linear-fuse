@@ -1,4 +1,4 @@
-# learn-c (LinearFS)
+# linear-fuse
 
 A small C playground that currently implements **LinearFS**: a read-only FUSE filesystem that exposes your Linear projects and issues as directories/files.
 
